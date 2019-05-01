@@ -16,12 +16,11 @@ namespace WebsocketServer
         private TcpListener _listener;
         private TcpClient _client;
         private NetworkStream _clientDataStream;
-        private TimeSpan _handshakeTimeout = new TimeSpan(0, 0, 10);
-        private TimeSpan _clientTimeout = new TimeSpan(0, 0, 10);
+        private TimeSpan _handshakeTimeout = new TimeSpan(0, 0, 10); /* Timeout from when client connects to them requesting a handshake */
+        private TimeSpan _clientTimeout = new TimeSpan(0, 0, 10); /* Time for a client to respond to a Ping-request before they are dropped */
         private Stopwatch _clientHeartbeatTracker = new Stopwatch();
-        private TimeSpan _checkClientInterval = new TimeSpan(0, 0, 30);
+        private TimeSpan _checkClientInterval = new TimeSpan(0, 1, 0); /* Interval at which at Ping-request is sent to the client */
         private readonly string _handshakeKey = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        private bool _running = false;
         private bool _expectingClientPong = false;
         private Stopwatch _clientPongCounter = new Stopwatch();
 
@@ -47,22 +46,22 @@ namespace WebsocketServer
 
         private readonly Dictionary<string, byte> _OPT_CODES = new Dictionary<string, byte>
         {
-            { "ContinuationFrame", 0x0 },
-            { "TextFrame", 0x1 },
-            { "BinaryFrame", 0x2 },
-            { "NonControlFrame1", 0x3 },
-            { "NonControlFrame2", 0x4 },
-            { "NonControlFrame3", 0x5 },
-            { "NonControlFrame4", 0x6 },
-            { "NonControlFrame5", 0x7 },
-            { "ConnectionClosed", 0x8 },
-            { "Ping", 0x9 },
-            { "Pong", 0xA },
-            { "ControlFrame1", 0xB },
-            { "ControlFrame2", 0xC },
-            { "ControlFrame3", 0xD },
-            { "ControlFrame4", 0xE },
-            { "ControlFrame5", 0xF }
+            { "ContinuationFrame", 0 },
+            { "TextFrame", 1 },
+            { "BinaryFrame", 2 },
+            { "NonControlFrame1", 3 },
+            { "NonControlFrame2", 4 },
+            { "NonControlFrame3", 5 },
+            { "NonControlFrame4", 6 },
+            { "NonControlFrame5", 7 },
+            { "ConnectionClosed", 8 },
+            { "Ping", 9 },
+            { "Pong", 10 },
+            { "ControlFrame1", 11 },
+            { "ControlFrame2", 12 },
+            { "ControlFrame3", 13 },
+            { "ControlFrame4", 14 },
+            { "ControlFrame5", 15 }
         };
 
         private struct MessageHeader
@@ -113,10 +112,9 @@ namespace WebsocketServer
         private void handleClient()
         {
             Console.WriteLine("Ready to send and receive messages to/from client" + Environment.NewLine);
-            _running = true;
             _clientHeartbeatTracker.Start();
 
-            while (_running)
+            while (true)
             {
                 Thread.Sleep(100);
                 if (_clientHeartbeatTracker.Elapsed > _checkClientInterval)
@@ -143,7 +141,7 @@ namespace WebsocketServer
         {
             string heartbeatIdentifier = "<:HEARTBEAT:>";
             byte[] heartbeatPayload = Encoding.UTF8.GetBytes(heartbeatIdentifier);
-            byte[] header = new byte[2] { (byte)(128 & _OPT_CODES["Ping"]), (byte)heartbeatIdentifier.Length };
+            byte[] header = new byte[2] { (byte)(128 | _OPT_CODES["Ping"]), (byte)heartbeatIdentifier.Length };
 
             _clientDataStream.Write(header, 0, header.Length);
             _clientDataStream.Write(heartbeatPayload, 0, heartbeatPayload.Length);
@@ -199,13 +197,10 @@ namespace WebsocketServer
 
         private void handleMessage(byte[] data)
         {
-
-            Console.WriteLine("Handling message");
-
-            byte[] decodedPayload = new byte[0];
             int maskingKeySize = 4;
             int maskingKeyStartIndex = 2;
             int payloadStartIndex = maskingKeyStartIndex + maskingKeySize;
+            byte[] decodedPayload = new byte[0];
 
             MessageHeader header = unpackHeader(data[0]);
 
@@ -225,64 +220,50 @@ namespace WebsocketServer
                 return;
             }
 
-            UInt64 payloadSize = (UInt64)(data[1] - 128 > 0 ? data[1] - 128 : 0);
+            calculatePayloadSize(ref header, data);
 
-            if (payloadSize == 0)
+            if (header.PAYLOAD_SIZE == 0)
             {
                 Console.WriteLine("Message has no payload data (or payload size is not set correctly)");
             }
 
-            if (payloadSize == 126)
+            if (header.PAYLOAD_SIZE == 126)
             {
-                if (BitConverter.IsLittleEndian)
-                    payloadSize = BitConverter.ToUInt16(new byte[] { data[3], data[2] }, 0);
-                else
-                    payloadSize = BitConverter.ToUInt16(new byte[] { data[2], data[3] }, 0);
-
                 maskingKeyStartIndex = maskingKeyStartIndex + 2;
                 payloadStartIndex = maskingKeyStartIndex + maskingKeySize;
             }
 
-            if (payloadSize == 127)
+            if (header.PAYLOAD_SIZE == 127)
             {
-                if (BitConverter.IsLittleEndian)
-                {
-                    payloadSize = BitConverter.ToUInt64(new byte[] {
-                        data[9], data[8], data[7], data[6],
-                        data[5], data[4], data[3], data[2]
-                    }, 0);
-                }
-                else
-                {
-                    payloadSize = BitConverter.ToUInt64(new byte[] {
-                        data[2], data[3], data[4], data[5],
-                        data[6], data[7], data[8], data[9]
-                    }, 0);
-                } 
-
                 maskingKeyStartIndex = maskingKeyStartIndex + 8;
                 payloadStartIndex = maskingKeyStartIndex + maskingKeySize;
             }
 
-            header.PAYLOAD_SIZE = payloadSize;
-
-            Console.WriteLine($"PAYLOAD SIZE: {payloadSize} bytes");
+            Console.WriteLine($"PAYLOAD SIZE: {header.PAYLOAD_SIZE} bytes");
             Console.WriteLine("--------- END MESSAGE HEADER ---------" + Environment.NewLine);
 
-            if (header.OPTCODE == _OPT_CODES["Pong"])
-                onPongReceived();
-
-            /* Only 32bit payloads are supported right now due to Buffer.BlockCopy not accepting 64bit values */
-            if (payloadSize > 0 && payloadSize < Int32.MaxValue)
+            /* 
+                Only 32bit payloads are supported due to Buffer.BlockCopy not accepting 64bit values.
+                However I think it is highly unlikely we will never receive more than 2GB of data...
+            */
+            if (header.PAYLOAD_SIZE > 0 && header.PAYLOAD_SIZE < Int32.MaxValue)
             {
-                byte[] encodedPayload = new byte[payloadSize];
+                Console.WriteLine("Decoding payload");
+
+                byte[] encodedPayload = new byte[header.PAYLOAD_SIZE];
                 byte[] maskingKey = new byte[maskingKeySize];
 
                 Buffer.BlockCopy(data, maskingKeyStartIndex, maskingKey, 0, maskingKeySize);
-                Buffer.BlockCopy(data, payloadStartIndex, encodedPayload, 0, (int)payloadSize);
+                Buffer.BlockCopy(data, payloadStartIndex, encodedPayload, 0, (int)header.PAYLOAD_SIZE);
 
                 decodedPayload = decodePayload(maskingKey, encodedPayload);
             }
+
+            /* Delegate to other handlers depending on optcode */
+
+            /* TODO(thomas): Client will typically echo whatever payload you send them back to you. Maybe we need to verify that? */
+            if (header.OPTCODE == _OPT_CODES["Pong"])
+                onPongReceived();
 
             if (header.OPTCODE == _OPT_CODES["TextFrame"] && decodedPayload.Length > 0)
                 onTextFrame(decodedPayload);
@@ -292,8 +273,37 @@ namespace WebsocketServer
 
             if (header.OPTCODE == _OPT_CODES["Ping"])
                 onPingReceived(decodedPayload);
+        }
 
-            return;
+        private void calculatePayloadSize(ref MessageHeader header, byte[] message)
+        {
+            header.PAYLOAD_SIZE = (UInt64)(message[1] - 128 > 0 ? message[1] - 128 : 0);
+
+            if (header.PAYLOAD_SIZE == 126)
+            {
+                if (BitConverter.IsLittleEndian)
+                    header.PAYLOAD_SIZE = BitConverter.ToUInt16(new byte[] { message[3], message[2] }, 0);
+                else
+                    header.PAYLOAD_SIZE = BitConverter.ToUInt16(new byte[] { message[2], message[3] }, 0);
+            }
+
+            if (header.PAYLOAD_SIZE == 127)
+            {
+                if (BitConverter.IsLittleEndian)
+                {
+                    header.PAYLOAD_SIZE = BitConverter.ToUInt64(new byte[] {
+                        message[9], message[8], message[7], message[6],
+                        message[5], message[4], message[3], message[2]
+                    }, 0);
+                }
+                else
+                {
+                    header.PAYLOAD_SIZE = BitConverter.ToUInt64(new byte[] {
+                        message[2], message[3], message[4],message[5],
+                        message[6], message[7], message[8],message[9]
+                    }, 0);
+                }
+            }
         }
 
         private byte[] decodePayload(byte[] maskingKey, byte[] encodedPayload)
@@ -312,9 +322,12 @@ namespace WebsocketServer
             var stopwatch = new Stopwatch();
             stopwatch.Start();
 
-            while(stopwatch.Elapsed < _handshakeTimeout)
+            while(true)
             {
-                while(!_clientDataStream.DataAvailable && _client.Available < 3) ;
+                if (stopwatch.Elapsed > _handshakeTimeout)
+                    break;
+
+                while (!_clientDataStream.DataAvailable && _client.Available < 3) ;
 
                 Byte[] bytes = new Byte[_client.Available];
                 _clientDataStream.Read(bytes, 0, bytes.Length);
@@ -379,7 +392,7 @@ namespace WebsocketServer
 
         private void onPingReceived(byte[] pingPayload)
         {
-            byte[] header = new byte[2] { (byte)(128 & _OPT_CODES["Pong"]), (byte)pingPayload.Length };
+            byte[] header = new byte[2] { (byte)(128 | _OPT_CODES["Pong"]), (byte)pingPayload.Length };
 
             _clientDataStream.Write(header, 0, header.Length);
             _clientDataStream.Write(pingPayload, 0, pingPayload.Length);
@@ -394,6 +407,13 @@ namespace WebsocketServer
         private void onBinaryFrame(byte[] frameData)
         {
             Console.WriteLine("BINARY FRAME: NOT IMPLEMENTED");
+        }
+
+        private void sendMessage(byte optcode, byte[] payload)
+        {
+            byte[] header = new byte[2] { (byte)(128 | optcode), (byte)payload.Length };
+            _clientDataStream.Write(header, 0, header.Length);
+            _clientDataStream.Write(payload, 0, payload.Length);
         }
     }
 }
