@@ -17,11 +17,15 @@ namespace WebsocketServer
         private TcpClient _client;
         private NetworkStream _clientDataStream;
         private TimeSpan _handshakeTimeout = new TimeSpan(0, 0, 10);
-        private TimeSpan _clientKeepAlive = new TimeSpan(0, 3, 0);
-        private Stopwatch _clientHeartbeatCounter = new Stopwatch();
-        private byte _sendMessageHeaderByte = 129;
+        private TimeSpan _clientTimeout = new TimeSpan(0, 0, 10);
+        private Stopwatch _clientHeartbeatTracker = new Stopwatch();
+        private TimeSpan _checkClientInterval = new TimeSpan(0, 0, 30);
+        private readonly string _handshakeKey = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        private bool _running = false;
+        private bool _expectingClientPong = false;
+        private Stopwatch _clientPongCounter = new Stopwatch();
 
-        private Dictionary<uint, string> _optcodeLabels = new Dictionary<uint, string>
+        private readonly Dictionary<uint, string> _OPTCODE_LABELS = new Dictionary<uint, string>
         {
             { 0x0, "0x0: Continuation frame" },
             { 0x1, "0x1: Text frame" },
@@ -39,6 +43,26 @@ namespace WebsocketServer
             { 0xD, "0xD: Control frame" },
             { 0xE, "0xE: Control frame" },
             { 0xF, "0xF: Control frame" }
+        };
+
+        private readonly Dictionary<string, byte> _OPT_CODES = new Dictionary<string, byte>
+        {
+            { "ContinuationFrame", 0x0 },
+            { "TextFrame", 0x1 },
+            { "BinaryFrame", 0x2 },
+            { "NonControlFrame1", 0x3 },
+            { "NonControlFrame2", 0x4 },
+            { "NonControlFrame3", 0x5 },
+            { "NonControlFrame4", 0x6 },
+            { "NonControlFrame5", 0x7 },
+            { "ConnectionClosed", 0x8 },
+            { "Ping", 0x9 },
+            { "Pong", 0xA },
+            { "ControlFrame1", 0xB },
+            { "ControlFrame2", 0xC },
+            { "ControlFrame3", 0xD },
+            { "ControlFrame4", 0xE },
+            { "ControlFrame5", 0xF }
         };
 
         private struct MessageHeader
@@ -89,11 +113,18 @@ namespace WebsocketServer
         private void handleClient()
         {
             Console.WriteLine("Ready to send and receive messages to/from client" + Environment.NewLine);
-            _clientHeartbeatCounter.Start();
+            _running = true;
+            _clientHeartbeatTracker.Start();
 
-            while (clientStillAlive())
+            while (_running)
             {
                 Thread.Sleep(100);
+                if (_clientHeartbeatTracker.Elapsed > _checkClientInterval)
+                    checkClientIsAlive();
+
+                if (_expectingClientPong && _clientPongCounter.Elapsed > _clientTimeout)
+                    break;
+
                 if (!_clientDataStream.DataAvailable)
                     continue;
 
@@ -101,25 +132,20 @@ namespace WebsocketServer
                 _clientDataStream.Read(bytes, 0, bytes.Length);
                 Console.WriteLine($"Message received from client ({bytes.Length} bytes)" + Environment.NewLine);
 
-                string decodedMessage = unpackAndHandleMessage(bytes);
-                Console.WriteLine("--------- MESSAGE ---------");
-                Console.WriteLine(decodedMessage);
-                Console.WriteLine("--------- END MESSAGE ---------" + Environment.NewLine);
-
-                
+                handleMessage(bytes);
             }
 
-            Console.WriteLine($"WARNING: Client hasn't responded within the keep-alive timeout {_clientKeepAlive}");
+            Console.WriteLine($"WARNING: Client hasn't responded to pings within the timeout {_checkClientInterval}");
             onDisconnectClient();
         }
 
-        private void sendHeartbeat()
+        private void pingClient()
         {
             string heartbeatIdentifier = "<:HEARTBEAT:>";
             byte[] heartbeatPayload = Encoding.UTF8.GetBytes(heartbeatIdentifier);
-            byte[] message = new byte[2] { _sendMessageHeaderByte, (byte)heartbeatIdentifier.Length };
+            byte[] header = new byte[2] { (byte)(128 & _OPT_CODES["Ping"]), (byte)heartbeatIdentifier.Length };
 
-            _clientDataStream.Write(message, 0, message.Length);
+            _clientDataStream.Write(header, 0, header.Length);
             _clientDataStream.Write(heartbeatPayload, 0, heartbeatPayload.Length);
         }
 
@@ -137,12 +163,26 @@ namespace WebsocketServer
             Console.WriteLine("------------------");
         }
 
-        private bool clientStillAlive()
+        private void checkClientIsAlive()
         {
-            if (_clientHeartbeatCounter.Elapsed > _clientKeepAlive)
-                return false;
+            Console.WriteLine("Sending Ping request to client to see if they are still alive");
 
-            return true;
+            _clientHeartbeatTracker.Reset();
+            _expectingClientPong = true;
+            _clientPongCounter.Start();
+            pingClient();
+        }
+
+        private void onPongReceived()
+        {
+            Console.WriteLine("Received Pong-message from cliet");
+
+            if (!_expectingClientPong)
+                return;
+
+            _clientPongCounter.Reset();
+            _expectingClientPong = false;
+            _clientHeartbeatTracker.Start();
         }
 
         private MessageHeader unpackHeader(byte headerByte)
@@ -157,38 +197,40 @@ namespace WebsocketServer
             };
         }
 
-        private string unpackAndHandleMessage(byte[] data)
+        private void handleMessage(byte[] data)
         {
-            sendHeartbeat();
 
             Console.WriteLine("Handling message");
+
+            byte[] decodedPayload = new byte[0];
             int maskingKeySize = 4;
             int maskingKeyStartIndex = 2;
             int payloadStartIndex = maskingKeyStartIndex + maskingKeySize;
 
-            byte optcode = (byte)(data[0] & 0xF);
-            byte rsv1 = (byte)(data[0] >> 4 & 1);
-            byte rsv2 = (byte)(data[0] >> 5 & 1);
-            byte rsv3 = (byte)(data[0] >> 6 & 1);
-            byte fin = (byte)(data[0] >> 7 & 1);
+            MessageHeader header = unpackHeader(data[0]);
 
-            string optcodeLabel = "Unknown optcode: " + optcode.ToString("X4");
-            _optcodeLabels.TryGetValue(optcode, out optcodeLabel);
+            string optcodeLabel = "Unknown optcode: " + header.OPTCODE.ToString("X4");
+            _OPTCODE_LABELS.TryGetValue(header.OPTCODE, out optcodeLabel);
 
             Console.WriteLine("--------- MESSAGE HEADER ---------");
             Console.WriteLine("OPTCODE: " + optcodeLabel);
-            Console.WriteLine("RSV1: " + rsv1);
-            Console.WriteLine("RSV2: " + rsv2);
-            Console.WriteLine("RSV3: " + rsv3);
-            Console.WriteLine("FIN: " + fin);
+            Console.WriteLine("RSV1: " + header.RSV1);
+            Console.WriteLine("RSV2: " + header.RSV2);
+            Console.WriteLine("RSV3: " + header.RSV2);
+            Console.WriteLine("FIN: " + header.FINAL);
 
             if ( (byte)(data[1] & 128) == 1 )
             {
                 Console.WriteLine("WARNING: Message is NOT masked, aborting");
-                return "<:NOT MASKED:>";
+                return;
             }
 
             UInt64 payloadSize = (UInt64)(data[1] - 128 > 0 ? data[1] - 128 : 0);
+
+            if (payloadSize == 0)
+            {
+                Console.WriteLine("Message has no payload data (or payload size is not set correctly)");
+            }
 
             if (payloadSize == 126)
             {
@@ -222,18 +264,36 @@ namespace WebsocketServer
                 payloadStartIndex = maskingKeyStartIndex + maskingKeySize;
             }
 
+            header.PAYLOAD_SIZE = payloadSize;
+
             Console.WriteLine($"PAYLOAD SIZE: {payloadSize} bytes");
             Console.WriteLine("--------- END MESSAGE HEADER ---------" + Environment.NewLine);
 
-            byte[] encodedPayload = new byte[payloadSize];
-            byte[] maskingKey = new byte[maskingKeySize];
+            if (header.OPTCODE == _OPT_CODES["Pong"])
+                onPongReceived();
 
-            Buffer.BlockCopy(data, maskingKeyStartIndex, maskingKey, 0, maskingKeySize);
-            Buffer.BlockCopy(data, payloadStartIndex, encodedPayload, 0, (int)payloadSize);
+            /* Only 32bit payloads are supported right now due to Buffer.BlockCopy not accepting 64bit values */
+            if (payloadSize > 0 && payloadSize < Int32.MaxValue)
+            {
+                byte[] encodedPayload = new byte[payloadSize];
+                byte[] maskingKey = new byte[maskingKeySize];
 
-            byte[] decodedPayload = decodePayload(maskingKey, encodedPayload);
+                Buffer.BlockCopy(data, maskingKeyStartIndex, maskingKey, 0, maskingKeySize);
+                Buffer.BlockCopy(data, payloadStartIndex, encodedPayload, 0, (int)payloadSize);
 
-            return Encoding.UTF8.GetString(decodedPayload);
+                decodedPayload = decodePayload(maskingKey, encodedPayload);
+            }
+
+            if (header.OPTCODE == _OPT_CODES["TextFrame"] && decodedPayload.Length > 0)
+                onTextFrame(decodedPayload);
+
+            if (header.OPTCODE == _OPT_CODES["BinaryFrame"] && decodedPayload.Length > 0)
+                onBinaryFrame(decodedPayload);
+
+            if (header.OPTCODE == _OPT_CODES["Ping"])
+                onPingReceived(decodedPayload);
+
+            return;
         }
 
         private byte[] decodePayload(byte[] maskingKey, byte[] encodedPayload)
@@ -250,6 +310,7 @@ namespace WebsocketServer
         {
             Console.WriteLine("Waiting to perform handshake");
             var stopwatch = new Stopwatch();
+            stopwatch.Start();
 
             while(stopwatch.Elapsed < _handshakeTimeout)
             {
@@ -280,8 +341,7 @@ namespace WebsocketServer
                 if (!WebsocketKeySearch.Success)
                 {
                     Console.WriteLine("WARNING: No websocket key is present in the request");
-                    _client.Close();
-                    Listen();
+                    onDisconnectClient();
                     return;
                 }
 
@@ -291,7 +351,7 @@ namespace WebsocketServer
                     + "Sec-WebSocket-Accept: " + Convert.ToBase64String(
                         SHA1.Create().ComputeHash(
                             Encoding.UTF8.GetBytes(
-                                WebsocketKeySearch.Groups[1].Value.Trim() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                                WebsocketKeySearch.Groups[1].Value.Trim() + _handshakeKey
                             )
                         )
                     ) + Environment.NewLine
@@ -312,8 +372,28 @@ namespace WebsocketServer
         {
             Console.WriteLine("Client disconnected on our end, closing connection");
             _client.Close();
-            _clientHeartbeatCounter.Reset();
+            _clientHeartbeatTracker.Reset();
+            _clientPongCounter.Reset();
             Listen();
+        }
+
+        private void onPingReceived(byte[] pingPayload)
+        {
+            byte[] header = new byte[2] { (byte)(128 & _OPT_CODES["Pong"]), (byte)pingPayload.Length };
+
+            _clientDataStream.Write(header, 0, header.Length);
+            _clientDataStream.Write(pingPayload, 0, pingPayload.Length);
+        }
+
+        private void onTextFrame(byte[] frameData)
+        {
+            Console.WriteLine("--------------------TEXT FRAME:");
+            Console.WriteLine(Encoding.UTF8.GetString(frameData) + Environment.NewLine);
+        }
+
+        private void onBinaryFrame(byte[] frameData)
+        {
+            Console.WriteLine("BINARY FRAME: NOT IMPLEMENTED");
         }
     }
 }
