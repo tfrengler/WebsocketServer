@@ -1,0 +1,29 @@
+Class: Server
+
+Listens for connection attempts
+Performs WS handshake
+If succesful creates a new WebsocketClient in a new thread
+Maintains a list of clients so they can be monitored
+
+Static Class: WebsocketProtocol
+
+Contains methods for dealing with the WS protocol
+Decoding and returning incoming messages
+Encodes/wraps messages to be sent
+
+Threaded Class: WebsocketClient
+
+Handles a single client
+Sends and responds to heartbeats (pings/pongs)
+Listens for incoming data
+Uses the WebsocketProtocol to decode and respond to messages
+Manages its own lifecycle, ending the client if disconnected
+
+STREAM READING CONSIDERATIONS:
+
+Read data into an array buffer.
+Once enough bytes have been received for the header, decode the message length (using WebsocketClient)
+Do a max size check on the message to prevent buffer overflows or crashes.
+Allocate array to buffer the message body and keep reading until full.
+Decode the message body (using WebsocketClient) and handle the message.
+Encode outgoing messages (using WebsocketClient) and send them to the client.
