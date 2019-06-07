@@ -1,14 +1,24 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Net;
+using System.Security.Cryptography;
 using System.Text;
-using System.Threading.Tasks;
+using System.Text.RegularExpressions;
 
 namespace WebsocketServer
 {
     static class WebsocketProtocol
     {
-        public static readonly Dictionary<uint, string> _OPTCODE_LABELS = new Dictionary<uint, string>
+        // PROPERTIES
+        private static Encoding TextEncoding { get; } = Encoding.UTF8;
+
+        public static string HandshakeKey { get; } = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+        public static int MaskingKeySize { get; } = 4;
+
+        public static int MaskingKeyStartIndex { get; } = 2;
+
+        public static Dictionary<uint, string> OPTCODE_LABELS { get; } = new Dictionary<uint, string>
         {
             { 0x0, "0x0: Continuation frame" },
             { 0x1, "0x1: Text frame" },
@@ -28,7 +38,7 @@ namespace WebsocketServer
             { 0xF, "0xF: Control frame" }
         };
 
-        private static readonly Dictionary<string, byte> _OPT_CODES = new Dictionary<string, byte>
+        public static Dictionary<string, byte> OPT_CODES { get; } = new Dictionary<string, byte>
         {
             { "ContinuationFrame", 0 },
             { "TextFrame", 1 },
@@ -48,21 +58,23 @@ namespace WebsocketServer
             { "ControlFrame5", 15 }
         };
 
-        private struct MessageHeader
+        public struct MessageHeader
         {
             public byte OPTCODE;
+            public byte MASKED;
             public byte RSV1;
             public byte RSV2;
             public byte RSV3;
             public byte FINAL;
-            public int PAYLOAD_SIZE;
         };
 
-        private static MessageHeader UnpackHeader(byte[] HeaderBytes)
+        // METHODS
+        public static MessageHeader GetUnpackedHeader(byte[] HeaderBytes)
         {
             return new MessageHeader()
             {
                 OPTCODE = (byte)(HeaderBytes[0] & 0xF),
+                MASKED = (byte)(HeaderBytes[1] & 128),
                 RSV1 = (byte)(HeaderBytes[0] >> 4 & 1),
                 RSV2 = (byte)(HeaderBytes[0] >> 5 & 1),
                 RSV3 = (byte)(HeaderBytes[0] >> 6 & 1),
@@ -70,9 +82,10 @@ namespace WebsocketServer
             };
         }
 
-        private static int CalculatePayloadSize(byte[] HeaderBytes)
+        public static int GetPayloadSize(byte[] HeaderBytes)
         {
             int PayloadSize = (HeaderBytes[1] - 128 > 0 ? HeaderBytes[1] - 128 : 0);
+            if (PayloadSize < 126) return PayloadSize;
 
             if (PayloadSize == 126)
             {
@@ -80,6 +93,8 @@ namespace WebsocketServer
                     PayloadSize = BitConverter.ToUInt16(new byte[] { HeaderBytes[3], HeaderBytes[2] }, 0);
                 else
                     PayloadSize = BitConverter.ToUInt16(new byte[] { HeaderBytes[2], HeaderBytes[3] }, 0);
+
+                return PayloadSize;
             }
 
             if (PayloadSize == 127)
@@ -98,10 +113,94 @@ namespace WebsocketServer
                         HeaderBytes[6], HeaderBytes[7], HeaderBytes[8], HeaderBytes[9]
                     }, 0);
                 }
+
+                return PayloadSize;
             }
 
-            return PayloadSize;
+            return -1;
         }
 
+        public static string PerformHandshake(byte[] HttpRequest)
+        {
+            if (HttpRequest.Length != 3)
+                throw new ArgumentException($"Argument 'Request' should be 3 bytes ({HttpRequest.Length})");
+
+            string requestDataAsString = TextEncoding.GetString(HttpRequest);
+
+            if (!new Regex("^GET").IsMatch(requestDataAsString))
+            {
+                Console.WriteLine("WARNING: Request is not of type GET, closing");
+                return "";
+            }
+
+            if (!new Regex("Connection: Upgrade").IsMatch(requestDataAsString) && !new Regex("Upgrade: websocket").IsMatch(requestDataAsString))
+            {
+                Console.WriteLine("WARNING: Request is not a websocket request, closing");
+                return "";
+            }
+
+            Match WebsocketKeySearch = new Regex("Sec-WebSocket-Key: (.*)").Match(requestDataAsString);
+            if (!WebsocketKeySearch.Success)
+            {
+                Console.WriteLine("WARNING: No websocket key is present in the request");
+                return "";
+            }
+
+            Console.WriteLine("Client authenticated for websocket connection");
+            return WebsocketKeySearch.Groups[1].Value.Trim();
+        }
+
+        public static byte[] GetProtocolUpgradeResponse(string ClientWebsocketKey)
+        {
+            return TextEncoding.GetBytes("HTTP/1.1 101 Switching Protocols" + Environment.NewLine
+                + "Connection: Upgrade" + Environment.NewLine
+                + "Upgrade: websocket" + Environment.NewLine
+                + "Sec-WebSocket-Accept: " + Convert.ToBase64String(
+                    SHA1.Create().ComputeHash(
+                        TextEncoding.GetBytes(
+                            ClientWebsocketKey + HandshakeKey
+                        )
+                    )
+                ) + Environment.NewLine
+                + Environment.NewLine);
+        }
+
+        public static byte[] DecodePayload(byte[] MaskingKey, byte[] EncodedPayload)
+        {
+            byte[] decoded = new byte[EncodedPayload.Length];
+            for (int i = 0; i < EncodedPayload.Length; i++)
+            {
+                decoded[i] = (byte)(EncodedPayload[i] ^ MaskingKey[i % 4]);
+            }
+            return decoded;
+        }
+
+        public static byte[] ComposeHeader(byte Optcode, ulong PayloadSize)
+        {
+            byte[] returnData;
+
+            if (PayloadSize > 125 && PayloadSize <= UInt16.MaxValue)
+            {
+                returnData = new byte[4];
+                returnData[1] = 126;
+                byte[] payloadSizeBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder((long)PayloadSize));
+                Buffer.BlockCopy(payloadSizeBytes, 0, returnData, 2, payloadSizeBytes.Length);
+            }
+            else if (PayloadSize > UInt16.MaxValue)
+            {
+                returnData = new byte[8];
+                returnData[1] = 127;
+                byte[] payloadSizeBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder((long)PayloadSize));
+                Buffer.BlockCopy(payloadSizeBytes, 0, returnData, 2, payloadSizeBytes.Length);
+            }
+            else
+            {
+                returnData = new byte[2];
+                returnData[1] = (byte)PayloadSize;
+            }
+
+            returnData[0] = (byte)(128 | Optcode);
+            return returnData;
+        }
     }
 }
