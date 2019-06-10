@@ -1,26 +1,32 @@
 ﻿using System;
+using System.Net;
 using System.Net.Sockets;
+using System.Threading;
+using System.Net.WebSockets;
 
 namespace WebsocketServer
 {
     class WebsocketClient
     {
         // PROPERTIES
-        private TcpClient Client;
-        private NetworkStream Stream;
+        private HttpListenerWebSocketContext Client;
+        private WebSocket Stream;
 
         // METHODS
-        public WebsocketClient(TcpClient ClientInstance)
+        public WebsocketClient(HttpListenerWebSocketContext Client)
         {
-            Client = ClientInstance;
-            Stream = Client.GetStream();
+            //Console.WriteLine($"Client connected ({ClientAddress.Address.ToString()}:{ClientAddress.Port.ToString()})");
+
+            this.Client = Client;
+            Stream = this.Client.WebSocket;
+            Console.WriteLine(Client.SecWebSocketKey);
         }
 
         public void SendMessage(byte Optcode, byte[] Payload)
         {
             byte[] header = WebsocketProtocol.ComposeHeader(Optcode, (ulong)Payload.Length);
-            Stream.Write(header, 0, header.Length);
-            Stream.Write(Payload, 0, Payload.Length);
+            //Stream.Write(header, 0, header.Length);
+            //Stream.Write(Payload, 0, Payload.Length);
         }
 
         private void HandleMessage(byte[] MessageData)
@@ -104,6 +110,15 @@ namespace WebsocketServer
             if (header.OPTCODE == WebsocketProtocol.OPT_CODES["Ping"])
                 //onPingReceived(decodedPayload);
                 Console.WriteLine("NOT IMPLEMENTED");
+        }
+
+        public void Listen()
+        {
+            while(true)
+            {
+                Console.WriteLine("Listening...");
+                Thread.Sleep(5000);
+            }
         }
     }
 }

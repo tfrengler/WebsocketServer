@@ -122,8 +122,8 @@ namespace WebsocketServer
 
         public static string PerformHandshake(byte[] HttpRequest)
         {
-            if (HttpRequest.Length != 3)
-                throw new ArgumentException($"Argument 'Request' should be 3 bytes ({HttpRequest.Length})");
+            /*if (HttpRequest.Length != 3)
+                throw new ArgumentException($"Argument 'Request' should be 3 bytes ({HttpRequest.Length})");*/
 
             string requestDataAsString = TextEncoding.GetString(HttpRequest);
 

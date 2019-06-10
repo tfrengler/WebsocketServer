@@ -2,41 +2,49 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
+using System.Net.WebSockets;
 
 namespace WebsocketServer
 {
     class Server
     {
         private const int MAX_CLIENTS = 8;
-        private readonly ConcurrentBag<Task> Clients;
-        public TcpListener Listener { get; }
+        private readonly ConcurrentBag<Task> Clients = new ConcurrentBag<Task>();
+        public HttpListener Gateway { get; }
+        public object TextEncoding { get; private set; }
 
         /* CONSTRUCTOR */
         public Server(string Address, int Port)
         {
-            Listener = new TcpListener(IPAddress.Parse(Address), Port);
-            Clients = new ConcurrentBag<Task>();
+            this.Gateway = new HttpListener();
+            this.Gateway.Prefixes.Add("http://" + Address + ":" + Port + "/");
 
-            Console.WriteLine($"WebsocketListener has been initialized on {Address}:{Port}" + Environment.NewLine);
+            Console.WriteLine($"Websocket server has been initialized on {Address}:{Port}" + Environment.NewLine);
         }
 
-        public void HandlePotentialClient(TcpClient Client)
-        {
-            Console.WriteLine($"Potential client connected from {((IPEndPoint)Client.Client.RemoteEndPoint).Address.ToString()}:{((IPEndPoint)Client.Client.RemoteEndPoint).Port.ToString()}");
-
-        }
-
-        public void Listen()
+        public async void Listen()
         {
             while (true)
             {
-                TcpClient newClient = Listener.AcceptTcpClient();
+                HttpListenerContext HttpConnection = this.Gateway.GetContext();
+                HttpListenerRequest HttpRequest = HttpConnection.Request;
 
-                if (Clients.Count < MAX_CLIENTS)
-                    Clients.Add(Task.Run(() => HandlePotentialClient(newClient)));
-                else
-                    Console.WriteLine("Max client connections reached");
+                if (HttpRequest.IsWebSocketRequest && Clients.Count < MAX_CLIENTS)
+                {
+                    HttpListenerWebSocketContext WebsocketConnection = await HttpConnection.AcceptWebSocketAsync("chat");
+                    WebsocketClient NewClient = new WebsocketClient(WebsocketConnection);
+                    Task.Run(()=> NewClient.Listen());
+                }
+
+                if (!HttpRequest.IsWebSocketRequest)
+                    Console.WriteLine("Not a WebSocket request, ignore");
+
+                if (Clients.Count == MAX_CLIENTS)
+                    Console.WriteLine("Too many clients connected");
+
+                Thread.Sleep(50);
             }
         }
 
@@ -44,16 +52,16 @@ namespace WebsocketServer
         {
             try
             {
-                Listener.Start();
+                this.Gateway.Start();
             }
-            catch (SocketException error)
+            catch (SocketException Error)
             {
-                Console.WriteLine("WARNING: WebsocketListener was NOT able to start");
-                Console.WriteLine(error.Message);
+                Console.WriteLine("WARNING: Listener was NOT able to start");
+                Console.WriteLine(Error.Message);
             }
 
             // Query status of clients loop?
-            Listen();
+            this.Listen();
         }
     }
 }
