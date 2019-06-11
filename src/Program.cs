@@ -1,11 +1,20 @@
-﻿namespace WebsocketServer
+﻿using System.Threading.Tasks;
+
+namespace WebsocketServer
 {
     class Program
     {
-        static void Main(string[] args)
+        static int Main(string[] args)
         {
             Server Server = new Server("127.0.0.1", 1234);
-            Server.Start();
+            if (!Server.Start())
+                return -1;
+
+            Task ListenTask = Task.Run(() => Server.ListenForAndAccecptClients());
+            Task MonitorTask = Task.Run(() => Server.MonitorAndManageClients());
+
+            while (!ListenTask.IsCompleted && !MonitorTask.IsCompleted) ;
+            return 1;
         }
     }
 }
